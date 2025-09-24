@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 import uuid
+import requests
 from datetime import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -15,8 +16,14 @@ SHEET_TAB = st.secrets.get("SHEET_TAB_NAME", "Violations")
 SERVICE_ACCOUNT_FILE = st.secrets.get("SERVICE_ACCOUNT_FILE", "service_account.json")
 ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 
+# ----------------------------------------------------------------
+# Apps Script endpoint config (replace if different)
+# ----------------------------------------------------------------
+APP_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxqqxbexB-r7LFJHvYJ2X_GsMoJvsmaGxmBVVFeTjU9oq8Pm04oX_Pp8ZlzxHnlbHRa/exec"
+APP_SCRIPT_PASSWORD = "supersecret123"   # <-- must match PASSWORD in your Apps Script
+
 # -----------------------
-# Authenticate to Google Sheets
+# Authenticate to Google Sheets (still kept for read fallback)
 # -----------------------
 creds = service_account.Credentials.from_service_account_file(
     SERVICE_ACCOUNT_FILE,
@@ -67,83 +74,67 @@ def read_sheet_as_df():
     df = pd.DataFrame(normalized_rows, columns=headers)
     return df
 
-
+# -----------------------
+# New: send add request to Apps Script
+# -----------------------
 def append_row(row_list):
-    """Append a row (list) to the sheet. This function will append values as-is."""
-    body = {"values": [row_list]}
-    sheets_service.spreadsheets().values().append(
-        spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A1",
-        valueInputOption="USER_ENTERED",
-        body=body
-    ).execute()
-
-
-def update_row_by_sheet_index(sheet_row_index, row_values):
     """
-    Update a specific row in the sheet.
-    sheet_row_index: actual sheet row number (e.g. 2 for first data row)
-    row_values: list of values matching the header columns (or shorter)
-    This function will fetch the current header, compute the last column, and
-    pad/truncate row_values to match header length before writing.
+    row_list is expected: [uid, timestamp, reporter, violator, category, description, coords, proofs]
+    This function will POST to the Apps Script web app to append the row.
     """
-    # get header row to determine number of columns
-    header_range = f"{SHEET_TAB}!A1:1"
-    header_resp = sheets_service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=header_range
-    ).execute()
-    headers = header_resp.get("values", [[]])[0]
-    if not headers:
-        st.error("Sheet header missing.")
-        return
+    # map to named fields expected by Apps Script
+    payload = {
+        "password": APP_SCRIPT_PASSWORD,
+        "action": "add",
+        "uid": row_list[0] if len(row_list) > 0 else "",
+        "timestamp": row_list[1] if len(row_list) > 1 else "",
+        "reporter": row_list[2] if len(row_list) > 2 else "",
+        "violator": row_list[3] if len(row_list) > 3 else "",
+        "category": row_list[4] if len(row_list) > 4 else "",
+        "description": row_list[5] if len(row_list) > 5 else "",
+        "coords": row_list[6] if len(row_list) > 6 else "",
+        "proofs": row_list[7] if len(row_list) > 7 else ""
+    }
+    try:
+        resp = requests.post(APP_SCRIPT_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+        j = resp.json() if resp.text else {}
+        if not j.get("ok", False):
+            raise Exception(f"Apps Script returned error: {j}")
+    except Exception as e:
+        # bubble up so UI can show error
+        raise
 
-    ncols = len(headers)
-    # pad or truncate row_values to ncols
-    if len(row_values) < ncols:
-        row_values = row_values + [""] * (ncols - len(row_values))
-    elif len(row_values) > ncols:
-        row_values = row_values[:ncols]
+# -----------------------
+# New: update via Apps Script (uses uid)
+# -----------------------
+def update_row_by_uid(uid, data_dict):
+    """
+    Update a row by uid via Apps Script.
+    data_dict: mapping of column_name -> value (e.g. {"description": "new text", "category":"Other"})
+    """
+    payload = {"password": APP_SCRIPT_PASSWORD, "action": "update", "uid": uid}
+    # copy allowed keys
+    for k, v in data_dict.items():
+        # only include simple values (strings/numbers)
+        if isinstance(v, (str, int, float)) or v is None:
+            payload[k] = "" if v is None else str(v)
+    try:
+        resp = requests.post(APP_SCRIPT_URL, json=payload, timeout=10)
+        resp.raise_for_status()
+        j = resp.json() if resp.text else {}
+        if not j.get("ok", False):
+            raise Exception(f"Apps Script returned error: {j}")
+    except Exception:
+        raise
 
-    # compute Excel-like last column (A..Z, then AA..), we can compute range by index
-    # simpler approach: build range using column index to letter mapping
-    def col_letter_from_index(idx):
-        """1-indexed -> column letter; e.g. 1 -> 'A', 27 -> 'AA'"""
-        letters = ""
-        while idx > 0:
-            idx, rem = divmod(idx - 1, 26)
-            letters = chr(65 + rem) + letters
-        return letters
-
-    last_col_letter = col_letter_from_index(ncols)
-    target_range = f"{SHEET_TAB}!A{sheet_row_index}:{last_col_letter}{sheet_row_index}"
-
-    body = {"values": [row_values]}
-    sheets_service.spreadsheets().values().update(
-        spreadsheetId=SHEET_ID,
-        range=target_range,
-        valueInputOption="USER_ENTERED",
-        body=body
-    ).execute()
-
-def append_row(row_list):
-    body = {"values": [row_list]}
-    sheets_service.spreadsheets().values().append(
-        spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!A1",
-        valueInputOption="USER_ENTERED",
-        body=body
-    ).execute()
-
-def update_row_by_sheet_index(sheet_row_index, row_values):
-    # sheet_row_index is 2-based? We'll compute A-based range: headers row=1; sheet row N => range row N
-    # Expect row_values include values for all columns in header order.
+# Keep a fallback update_by_sheet_index that uses Sheets API (in case uid cannot be found)
+def update_row_by_sheet_index_fallback(sheet_row_index, row_values):
     header_range = f"{SHEET_TAB}!A1:1"
     header = sheets_service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=header_range).execute().get("values", [[]])[0]
     if not header:
         st.error("Sheet has no header row.")
         return
-    # build range like A{row}:<lastcol>{row}
     last_col = chr(ord("A") + len(header) - 1)
     target_range = f"{SHEET_TAB}!A{sheet_row_index}:{last_col}{sheet_row_index}"
     body = {"values": [row_values]}
@@ -185,10 +176,6 @@ if not df.empty:
     # Insert sheet_row index (sheet rows start at 2 because header is row 1)
     df_display = df.copy()
     df_display.insert(0, "sheet_row", [i + 2 for i in range(len(df_display))])
-
-    # Optional: reorder so important columns show first (adjust to your headers)
-    # cols_order = ["sheet_row", "id", "timestamp", "reporter", "violator", "category", "description", "coords", "proof_link"]
-    # df_display = df_display[[c for c in cols_order if c in df_display.columns]]
 
     # Configure column behavior: make 'description' a multiline text editor and 'proof_link' wide
     column_cfg = {}
@@ -235,12 +222,49 @@ if not df.empty:
             # Build values in the same order as header_vals
             row_values = [row.get(col, "") for col in header_vals]
 
-            # Ensure update function exists in your code
-            try:
-                update_row_by_sheet_index(sheet_row, row_values)
-                updated_count += 1
-            except Exception as e:
-                st.error(f"Failed to update sheet row {sheet_row}: {e}")
+            # Try to obtain uid for update. Prefer edited 'uid' column if present,
+            # else use original df to fetch the uid from that sheet_row.
+            uid_val = None
+            if "uid" in row.index and row.get("uid"):
+                uid_val = row.get("uid")
+            else:
+                # compute index into original df: sheet_row-2
+                try:
+                    orig_idx = sheet_row - 2
+                    if 0 <= orig_idx < len(df):
+                        if "uid" in df.columns:
+                            uid_val = df.iloc[orig_idx].get("uid", "")
+                except Exception:
+                    uid_val = None
+
+            # If uid found, send update via Apps Script
+            if uid_val:
+                # build data dict mapping header->value (only include columns present in header)
+                data_dict = {}
+                for col in header_vals:
+                    # get updated value from edited row (if exists), else ""
+                    data_dict[col] = row.get(col, "")
+                # attempt update via webapp
+                try:
+                    update_row_by_uid(uid_val, data_dict)
+                    updated_count += 1
+                    continue
+                except Exception as e:
+                    # fallback to direct Sheets API update if the webapp update fails
+                    try:
+                        update_row_by_sheet_index_fallback(sheet_row, row_values)
+                        updated_count += 1
+                        continue
+                    except Exception as e2:
+                        st.error(f"Failed to update sheet row {sheet_row}: {e}; fallback error: {e2}")
+                        continue
+            else:
+                # No uid available — fallback to direct Sheets API update
+                try:
+                    update_row_by_sheet_index_fallback(sheet_row, row_values)
+                    updated_count += 1
+                except Exception as e:
+                    st.error(f"Failed to update sheet row {sheet_row}: {e}")
 
         st.success(f"Saved updates to {updated_count} row(s).")
 else:
@@ -269,6 +293,9 @@ if submitted:
         timestamp = datetime.combine(date_val, time_val).isoformat()
         links = proof_links.strip()
         row = [uid, timestamp, reporter, violator, category, description, coords, links]
-        append_row(row)
-        st.success("Report added to sheet.")
-        st.rerun()
+        try:
+            append_row(row)
+            st.success("Report added to sheet.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to add report: {e}")
