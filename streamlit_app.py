@@ -19,7 +19,7 @@ ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 # ----------------------------------------------------------------
 # Apps Script endpoint config (replace if different)
 # ----------------------------------------------------------------
-APP_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxqqxbexB-r7LFJHvYJ2X_GsMoJvsmaGxmBVVFeTjU9oq8Pm04oX_Pp8ZlzxHnlbHRa/exec"
+APP_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzjI4dIOKsINA5trETvaDcLfof9tIpshmwTTvVnTIUjQmE4cD1HPa_dhZnRcp6vW1BZ/exec"
 APP_SCRIPT_PASSWORD = "supersecret123"   # <-- must match PASSWORD in your Apps Script
 
 # -----------------------
