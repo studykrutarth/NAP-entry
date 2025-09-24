@@ -1,88 +1,78 @@
-# NAP.py
+# NAP.py - Streamlit app that uses Apps Script web app for reads/writes
 import streamlit as st
 import pandas as pd
 import uuid
 import requests
 from datetime import datetime
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
 
 # -----------------------
 # Config / secrets
 # -----------------------
 st.set_page_config("NAP Logger", layout="wide")
-SHEET_ID = st.secrets["SHEET_ID"]
+
+APP_SCRIPT_URL = st.secrets.get("APP_SCRIPT_URL", None)
+APP_SCRIPT_PASSWORD = st.secrets.get("APP_SCRIPT_PASSWORD", None)
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", None)
 SHEET_TAB = st.secrets.get("SHEET_TAB_NAME", "Violations")
-SERVICE_ACCOUNT_FILE = st.secrets.get("SERVICE_ACCOUNT_FILE", "service_account.json")
-ADMIN_PASSWORD = st.secrets["ADMIN_PASSWORD"]
 
-# ----------------------------------------------------------------
-# Apps Script endpoint config (replace if different)
-# ----------------------------------------------------------------
-APP_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzjI4dIOKsINA5trETvaDcLfof9tIpshmwTTvVnTIUjQmE4cD1HPa_dhZnRcp6vW1BZ/exec"
-APP_SCRIPT_PASSWORD = "supersecret123"   # <-- must match PASSWORD in your Apps Script
+# Basic checks for required secrets
+missing = []
+if not APP_SCRIPT_URL:
+    missing.append("APP_SCRIPT_URL")
+if not APP_SCRIPT_PASSWORD:
+    missing.append("APP_SCRIPT_PASSWORD")
+if not ADMIN_PASSWORD:
+    missing.append("ADMIN_PASSWORD")
+
+if missing:
+    st.title("🔧 NAP Logger — configuration required")
+    st.error(
+        "Your app is missing required secrets: " + ", ".join(missing) +
+        ".\n\nIf you're on Streamlit Cloud: open Manage app → Settings → Secrets and add them.\n\n"
+        "Locally: create .streamlit/secrets.toml with these keys."
+    )
+    st.stop()
 
 # -----------------------
-# Authenticate to Google Sheets (still kept for read fallback)
+# Helpers (Apps Script integration)
 # -----------------------
-creds = service_account.Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
-sheets_service = build("sheets", "v4", credentials=creds)
-
-# -----------------------
-# Helpers
-# -----------------------
-# robust sheet helpers
 def read_sheet_as_df():
     """
-    Read the sheet and normalize rows so each row has equal length.
-    Returns a pandas.DataFrame.
+    Read sheet data from the Apps Script doGet endpoint.
+    Endpoint returns JSON: { ok: true, data: [ [header...], [row1...], ... ] }
     """
-    range_name = f"{SHEET_TAB}!A1:Z10000"
-    resp = sheets_service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=range_name
-    ).execute()
-    vals = resp.get("values", [])
-    if not vals:
+    try:
+        resp = requests.get(APP_SCRIPT_URL, timeout=10)
+        resp.raise_for_status()
+        j = resp.json()
+        if not j.get("ok", False):
+            st.error(f"Apps Script error: {j.get('error')}")
+            return pd.DataFrame()
+        data = j.get("data", [])
+        if not data or len(data) < 1:
+            return pd.DataFrame()
+        headers = [str(h) for h in data[0]]
+        rows = data[1:]
+        # normalize lengths
+        max_len = max(len(headers), max((len(r) for r in rows), default=0))
+        headers = headers + [f"col_{i}" for i in range(len(headers)+1, max_len+1)]
+        normalized = []
+        for r in rows:
+            if len(r) < max_len:
+                normalized.append(r + [""] * (max_len - len(r)))
+            else:
+                normalized.append(r[:max_len])
+        df = pd.DataFrame(normalized, columns=headers)
+        return df
+    except Exception as e:
+        st.error(f"Failed to read from Apps Script: {e}")
         return pd.DataFrame()
 
-    # header is first row
-    headers = vals[0]
-    data_rows = vals[1:]
-
-    # find max length across header and all rows
-    max_len = max(len(headers), max((len(r) for r in data_rows), default=0))
-
-    # pad header to max_len (if someone added trailing columns in data)
-    headers = headers + ["col_{}".format(i) for i in range(len(headers)+1, max_len+1)]
-
-    # normalize each data row to max_len by padding with empty strings
-    normalized_rows = []
-    for r in data_rows:
-        if len(r) < max_len:
-            normalized_rows.append(r + [""] * (max_len - len(r)))
-        elif len(r) > max_len:
-            # If a row is longer than max_len (rare), truncate to max_len
-            normalized_rows.append(r[:max_len])
-        else:
-            normalized_rows.append(r)
-
-    # build DataFrame
-    df = pd.DataFrame(normalized_rows, columns=headers)
-    return df
-
-# -----------------------
-# New: send add request to Apps Script
-# -----------------------
-def append_row(row_list):
+def append_row_via_script(row_list):
     """
-    row_list is expected: [uid, timestamp, reporter, violator, category, description, coords, proofs]
-    This function will POST to the Apps Script web app to append the row.
+    row_list expected: [uid, timestamp, reporter, violator, category, description, coords, proofs]
+    Posts to Apps Script with action=add.
     """
-    # map to named fields expected by Apps Script
     payload = {
         "password": APP_SCRIPT_PASSWORD,
         "action": "add",
@@ -95,58 +85,29 @@ def append_row(row_list):
         "coords": row_list[6] if len(row_list) > 6 else "",
         "proofs": row_list[7] if len(row_list) > 7 else ""
     }
-    try:
-        resp = requests.post(APP_SCRIPT_URL, json=payload, timeout=10)
-        resp.raise_for_status()
-        j = resp.json() if resp.text else {}
-        if not j.get("ok", False):
-            raise Exception(f"Apps Script returned error: {j}")
-    except Exception as e:
-        # bubble up so UI can show error
-        raise
+    resp = requests.post(APP_SCRIPT_URL, json=payload, timeout=10)
+    resp.raise_for_status()
+    j = resp.json() if resp.text else {}
+    if not j.get("ok", False):
+        raise Exception(f"Apps Script error (add): {j}")
 
-# -----------------------
-# New: update via Apps Script (uses uid)
-# -----------------------
-def update_row_by_uid(uid, data_dict):
+def update_row_via_script(uid, data_dict):
     """
-    Update a row by uid via Apps Script.
-    data_dict: mapping of column_name -> value (e.g. {"description": "new text", "category":"Other"})
+    Update a row by uid via Apps Script. data_dict maps column_name->value.
     """
     payload = {"password": APP_SCRIPT_PASSWORD, "action": "update", "uid": uid}
-    # copy allowed keys
+    # include stringifiable values
     for k, v in data_dict.items():
-        # only include simple values (strings/numbers)
         if isinstance(v, (str, int, float)) or v is None:
             payload[k] = "" if v is None else str(v)
-    try:
-        resp = requests.post(APP_SCRIPT_URL, json=payload, timeout=10)
-        resp.raise_for_status()
-        j = resp.json() if resp.text else {}
-        if not j.get("ok", False):
-            raise Exception(f"Apps Script returned error: {j}")
-    except Exception:
-        raise
-
-# Keep a fallback update_by_sheet_index that uses Sheets API (in case uid cannot be found)
-def update_row_by_sheet_index_fallback(sheet_row_index, row_values):
-    header_range = f"{SHEET_TAB}!A1:1"
-    header = sheets_service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=header_range).execute().get("values", [[]])[0]
-    if not header:
-        st.error("Sheet has no header row.")
-        return
-    last_col = chr(ord("A") + len(header) - 1)
-    target_range = f"{SHEET_TAB}!A{sheet_row_index}:{last_col}{sheet_row_index}"
-    body = {"values": [row_values]}
-    sheets_service.spreadsheets().values().update(
-        spreadsheetId=SHEET_ID,
-        range=target_range,
-        valueInputOption="USER_ENTERED",
-        body=body
-    ).execute()
+    resp = requests.post(APP_SCRIPT_URL, json=payload, timeout=10)
+    resp.raise_for_status()
+    j = resp.json() if resp.text else {}
+    if not j.get("ok", False):
+        raise Exception(f"Apps Script error (update): {j}")
 
 # -----------------------
-# Simple auth
+# Simple auth (Streamlit-level)
 # -----------------------
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -165,10 +126,11 @@ if not st.session_state.logged_in:
 # -----------------------
 # Main UI
 # -----------------------
-st.title("📋 NAP Violation Logs (Google Sheets)")
+st.title("📋 NAP Violation Logs (Google Sheets via Apps Script)")
 
 # Load data
 df = read_sheet_as_df()
+
 # --- Editable table with multi-line description ---
 if not df.empty:
     st.subheader("Existing logs — edit then press Save changes")
@@ -183,7 +145,7 @@ if not df.empty:
         column_cfg["description"] = st.column_config.TextColumn(
             "description",
             help="Detailed description of the incident",
-            width="wide",      # wide so it shows more text
+            width="wide",
             max_chars=2000
         )
     if "proof_link" in df_display.columns:
@@ -206,12 +168,10 @@ if not df.empty:
 
     # Save button: write back any changes to the sheet
     if st.button("Save changes"):
-        # We will update every row shown in the editor (safe approach)
-        # Get the header order from the original sheet (df)
         header_vals = list(df.columns)
-
-        # Iterate through edited rows and update the corresponding sheet row
         updated_count = 0
+        errors = []
+
         for _, row in edited.iterrows():
             try:
                 sheet_row = int(row["sheet_row"])
@@ -228,7 +188,6 @@ if not df.empty:
             if "uid" in row.index and row.get("uid"):
                 uid_val = row.get("uid")
             else:
-                # compute index into original df: sheet_row-2
                 try:
                     orig_idx = sheet_row - 2
                     if 0 <= orig_idx < len(df):
@@ -237,38 +196,27 @@ if not df.empty:
                 except Exception:
                     uid_val = None
 
-            # If uid found, send update via Apps Script
             if uid_val:
-                # build data dict mapping header->value (only include columns present in header)
+                # build data dict mapping header->value
                 data_dict = {}
                 for col in header_vals:
-                    # get updated value from edited row (if exists), else ""
                     data_dict[col] = row.get(col, "")
-                # attempt update via webapp
+                # attempt update via Apps Script
                 try:
-                    update_row_by_uid(uid_val, data_dict)
+                    update_row_via_script(uid_val, data_dict)
                     updated_count += 1
-                    continue
                 except Exception as e:
-                    # fallback to direct Sheets API update if the webapp update fails
-                    try:
-                        update_row_by_sheet_index_fallback(sheet_row, row_values)
-                        updated_count += 1
-                        continue
-                    except Exception as e2:
-                        st.error(f"Failed to update sheet row {sheet_row}: {e}; fallback error: {e2}")
-                        continue
+                    errors.append(f"Row {sheet_row} (uid={uid_val}) update failed: {e}")
             else:
-                # No uid available — fallback to direct Sheets API update
-                try:
-                    update_row_by_sheet_index_fallback(sheet_row, row_values)
-                    updated_count += 1
-                except Exception as e:
-                    st.error(f"Failed to update sheet row {sheet_row}: {e}")
+                errors.append(f"Row {sheet_row} skipped: uid not found.")
 
+        if errors:
+            for e in errors:
+                st.error(e)
         st.success(f"Saved updates to {updated_count} row(s).")
 else:
     st.info("No logs found. Make sure your sheet has a header row and data.")
+
 # Add new report form
 st.subheader("➕ Add new report")
 with st.form("add_form"):
@@ -294,7 +242,7 @@ if submitted:
         links = proof_links.strip()
         row = [uid, timestamp, reporter, violator, category, description, coords, links]
         try:
-            append_row(row)
+            append_row_via_script(row)
             st.success("Report added to sheet.")
             st.rerun()
         except Exception as e:
